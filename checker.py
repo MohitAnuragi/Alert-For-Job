@@ -5,6 +5,7 @@ Sends HTML email alerts via Gmail SMTP when new openings are detected.
 State is persisted in seen_jobs.json committed back to GitHub.
 """
 
+import csv
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import random
 import re
 import smtplib
 import ssl
+import sys
 import time
 import urllib.parse
 from datetime import date
@@ -32,6 +34,7 @@ logger = logging.getLogger(__name__)
 # ─── Constants ───────────────────────────────────────────────────────────────
 
 SEEN_JOBS_FILE = "seen_jobs.json"
+WHITELIST_CSV_FILE = "final_master_startup_sheet_150.csv"
 RECIPIENT_EMAIL = "crazymohit468@gmail.com"
 MAX_RETRIES = 3
 BASE_BACKOFF = 2  # seconds
@@ -70,6 +73,150 @@ COMPANIES = [
     "Ninjacart", "Frnd", "Turnip", "Loco", "Bolo Live", "Kubeapps",
     "M365Consult", "Ekagga Technology", "NewSpace Research",
 ]
+
+APPROVED_ROLE_PHRASES = (
+    "android developer", "android engineer", "android software engineer",
+    "android application developer", "android mobile developer",
+    "mobile developer", "mobile engineer", "mobile software engineer",
+    "software engineer android", "software engineer - android",
+    "software development engineer android", "android platform engineer",
+    "android sdk engineer", "android intern", "android engineering intern",
+    "mobile developer intern", "mobile engineering intern",
+    "android application intern", "android software intern", "android trainee",
+    "android graduate engineer", "junior android developer",
+    "associate android developer", "kotlin developer", "kotlin engineer",
+    "kotlin software engineer", "backend kotlin developer",
+    "backend kotlin engineer", "jvm developer", "jvm engineer",
+    "backend developer", "backend engineer", "java backend engineer",
+    "java developer", "java software engineer", "java engineer",
+    "spring boot developer", "spring boot engineer",
+    "software engineer backend", "backend software engineer",
+    "api developer", "server-side developer", "platform engineer backend",
+    "associate backend engineer", "junior backend developer",
+    "backend intern", "java intern", "backend engineering intern",
+    "full stack developer", "full stack engineer",
+    "software engineer full stack", "software developer full stack",
+    "full stack software engineer", "mern developer", "mean developer",
+    "node.js developer", "node.js engineer", "express.js developer",
+    "express.js engineer", "typescript developer", "typescript engineer",
+    "javascript full stack developer", "associate full stack engineer",
+    "junior full stack developer", "full stack intern",
+    "node.js intern", "full stack engineering intern",
+    "software engineer", "software developer",
+    "software development engineer", "sde", "sde i", "sde-1",
+    "software engineer i", "software engineer 1",
+    "associate software engineer", "graduate software engineer",
+    "graduate engineer", "graduate software developer",
+    "entry level software engineer", "early career software engineer",
+    "junior software engineer", "software engineering intern",
+    "software developer intern", "engineering intern",
+    "technical intern", "application engineer", "product engineer",
+    "platform engineer", "systems engineer software",
+    "solutions engineer software",
+)
+
+APPROVED_EXPERIENCE_TERMS = (
+    "intern", "internship", "new grad", "graduate", "associate",
+    "entry level", "junior", "0-1 years", "0-2 years", "1 year",
+    "freshers", "campus hiring", "university hiring", "college hiring",
+    "software engineer i", "sde i", "graduate program",
+    "early career", "return offer program",
+)
+
+REJECTED_TITLE_TERMS = (
+    "senior", "sr.", "lead", "principal", "manager", "director",
+    "staff engineer", "architect", "vp", "head", "10+ years",
+    "8+ years", "7+ years", "6+ years", "5+ years",
+    "ui designer", "ux designer", "graphic designer", "marketing",
+    "growth", "sales", "business development", "finance", "hr",
+    "recruiter", "talent acquisition", "customer success", "support engineer",
+    "it support", "network engineer", "devops", "cloud engineer",
+    "data analyst", "business analyst", "data scientist",
+    "machine learning engineer", "ai researcher", "research scientist",
+    "prompt engineer", "embedded engineer", "hardware engineer",
+    "qa engineer", "automation tester", "manual tester",
+    "security engineer", "cyber security", "blockchain", "sap",
+    "oracle consultant", "game developer", "unity developer",
+    "flutter developer", "react native developer", "ios developer",
+    "php developer", "wordpress developer", "seo", "content writer",
+    "technical writer", "legal", "operations", "procurement",
+    "supply chain", "admin",
+)
+
+
+def _normalize_text(text: str) -> str:
+    """Normalize text for strict keyword matching."""
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def normalize_company_name(company_name: str) -> str:
+    """Normalize a company name for whitelist comparison."""
+    normalized = re.sub(r"\s+", " ", (company_name or "").strip()).lower()
+    if not normalized:
+        return ""
+
+    removable_suffixes = [
+        "pvt", "pvt.", "pvt ltd", "pvt. ltd.", "private limited",
+        "inc", "llc", "ltd", "limited", "technologies", "technology",
+        "tech", "labs", "solutions", "ai",
+    ]
+
+    for suffix in removable_suffixes:
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)].strip()
+            break
+
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def load_company_whitelist(csv_path: str = WHITELIST_CSV_FILE) -> set[str]:
+    """Load approved companies from the CSV once and return them as a set."""
+    if not os.path.exists(csv_path):
+        logger.error("ERROR\nUnable to load company whitelist.\nFile:\n%s\nExecution stopped.", csv_path)
+        sys.exit(1)
+
+    try:
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            companies = {
+                normalize_company_name(row.get("Company", ""))
+                for row in reader
+                if normalize_company_name(row.get("Company", ""))
+            }
+    except Exception as exc:
+        logger.error("ERROR\nUnable to load company whitelist.\nFile:\n%s\nExecution stopped.", csv_path)
+        logger.error("CSV parse error: %s", exc)
+        sys.exit(1)
+
+    if not companies:
+        logger.error("ERROR\nUnable to load company whitelist.\nFile:\n%s\nExecution stopped.", csv_path)
+        sys.exit(1)
+
+    logger.info("Loaded company whitelist.")
+    logger.info("Approved companies: %d", len(companies))
+    return companies
+
+
+def is_relevant_job(title: str, experience_text: str = "", description: str = "") -> bool:
+    """Apply the strict candidate-specific role and experience filter."""
+    combined_text = " ".join(filter(None, [title, experience_text, description]))
+    normalized_text = _normalize_text(combined_text)
+
+    if not normalized_text:
+        return False
+
+    if any(term in normalized_text for term in REJECTED_TITLE_TERMS):
+        return False
+
+    if not any(phrase in normalized_text for phrase in APPROVED_ROLE_PHRASES):
+        return False
+
+    if not any(term in normalized_text for term in APPROVED_EXPERIENCE_TERMS):
+        return False
+
+    return True
+
 
 # ─── HTTP Helper ─────────────────────────────────────────────────────────────
 
@@ -556,6 +703,7 @@ def main() -> None:
     logger.info("Job Alert Monitor starting — checking %d companies.", len(COMPANIES))
     logger.info("═" * 60)
 
+    approved_companies = load_company_whitelist()
     seen_jobs: set[str] = load_seen_jobs()
     all_new_jobs: list[dict] = []
     errors: int = 0
@@ -570,13 +718,30 @@ def main() -> None:
                 logger.info("  → LinkedIn empty, trying Google fallback...")
                 jobs = get_google_jobs(company)
 
-            # Filter to only truly new jobs
+            # Filter to only truly new jobs that match the candidate profile
             for job in jobs:
                 key = job["job_id"]
+                title = job.get("title", "")
+                company_name = job.get("company", "")
+                normalized_company = normalize_company_name(company_name)
+
+                logger.info("Company: %s", company_name)
+                logger.info("Normalized: %s", normalized_company)
+                if normalized_company not in approved_companies:
+                    logger.info("Whitelist: NO")
+                    logger.info("Skipping job.")
+                    continue
+
+                logger.info("Whitelist: YES")
+
+                if not is_relevant_job(title):
+                    logger.info("  ⏭ SKIP: %s @ %s (not a strong match)", title, company_name)
+                    continue
+
                 if key and key not in seen_jobs:
                     all_new_jobs.append(job)
                     seen_jobs.add(key)
-                    logger.info("  ✦ NEW: %s @ %s (%s)", job["title"], job["company"], key)
+                    logger.info("  ✦ NEW: %s @ %s (%s)", title, company_name, key)
 
         except Exception as exc:
             errors += 1
