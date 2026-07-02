@@ -143,6 +143,16 @@ REJECTED_TITLE_TERMS = (
     "supply chain", "admin",
 )
 
+SOURCE_PRIORITY = {
+    "Careers": 0,
+    "Greenhouse": 1,
+    "Lever": 2,
+    "Ashby": 3,
+    "Wellfound": 4,
+    "LinkedIn": 5,
+    "Google": 6,
+}
+
 
 def _normalize_text(text: str) -> str:
     """Normalize text for strict keyword matching."""
@@ -179,11 +189,12 @@ def load_company_whitelist(csv_path: str = WHITELIST_CSV_FILE) -> set[str]:
     try:
         with open(csv_path, "r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
-            companies = {
-                normalize_company_name(row.get("Company", ""))
-                for row in reader
-                if normalize_company_name(row.get("Company", ""))
-            }
+            companies = set()
+            for row in reader:
+                company_name = row.get("Company") or row.get("Name") or ""
+                normalized_company = normalize_company_name(company_name)
+                if normalized_company:
+                    companies.add(normalized_company)
     except Exception as exc:
         logger.error("ERROR\nUnable to load company whitelist.\nFile:\n%s\nExecution stopped.", csv_path)
         logger.error("CSV parse error: %s", exc)
@@ -198,6 +209,42 @@ def load_company_whitelist(csv_path: str = WHITELIST_CSV_FILE) -> set[str]:
     logger.info("%s", csv_path)
     logger.info("Approved companies: %d", len(companies))
     return companies
+
+
+def _job_source_rank(source_name: str) -> int:
+    return SOURCE_PRIORITY.get(source_name, 99)
+
+
+def _make_job_key(job: dict) -> str:
+    company = normalize_company_name(job.get("company", ""))
+    title = _normalize_text(job.get("title", ""))
+    location = _normalize_text(job.get("location", ""))
+    return f"{company}|{title}|{location}"
+
+
+def deduplicate_jobs(jobs: list[dict]) -> list[dict]:
+    """Collapse duplicate opportunities across multiple sources and prefer better apply links."""
+    deduped: dict[str, dict] = {}
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        key = _make_job_key(job)
+        if key not in deduped:
+            deduped[key] = dict(job)
+            continue
+
+        existing = deduped[key]
+        current_rank = _job_source_rank(job.get("source", "Google"))
+        existing_rank = _job_source_rank(existing.get("source", "Google"))
+        if current_rank < existing_rank:
+            deduped[key] = dict(job)
+            continue
+        if current_rank == existing_rank:
+            current_url = (job.get("job_url") or job.get("apply_url") or "").strip()
+            existing_url = (existing.get("job_url") or existing.get("apply_url") or "").strip()
+            if current_url and not existing_url:
+                deduped[key] = dict(job)
+    return list(deduped.values())
 
 
 def is_relevant_job(title: str, experience_text: str = "", description: str = "") -> bool:
@@ -296,7 +343,7 @@ def get_linkedin_jobs(company_name: str) -> list[dict]:
         if response is None:
             return []
 
-        soup = BeautifulSoup(response.text, "lxml")
+        soup = BeautifulSoup(response.text, "html.parser")
         jobs: list[dict] = []
 
         # LinkedIn job cards appear in <ul class="jobs-search__results-list">
@@ -403,11 +450,7 @@ def get_google_jobs(company_name: str) -> list[dict]:
         if response is None:
             return []
 
-        soup = BeautifulSoup(response.text, "lxml")
-        jobs: list[dict] = []
-        seen_ids: set[str] = set()
-
-        # Extract all href attributes containing linkedin.com/jobs/view
+        soup = BeautifulSoup(response.text, "html.parser")
         for tag in soup.find_all("a", href=True):
             href = tag["href"]
             # Google wraps links in /url?q=...
@@ -509,6 +552,9 @@ def _build_html_email(new_jobs: list[dict]) -> str:
           <td style="padding:12px 16px; border-bottom:1px solid #2d3748; color:#718096; font-size:13px;">
             {_esc(job.get('posted_time') or 'Last 24h')}
           </td>
+          <td style="padding:12px 16px; border-bottom:1px solid #2d3748; color:#cbd5e0; font-size:13px;">
+            {_esc(job.get('source', 'LinkedIn'))}
+          </td>
           <td style="padding:12px 16px; border-bottom:1px solid #2d3748; text-align:center;">
             <a href="{apply_url}"
                style="display:inline-block; padding:7px 18px; background:linear-gradient(135deg,#667eea,#764ba2);
@@ -578,6 +624,10 @@ def _build_html_email(new_jobs: list[dict]) -> str:
                       <th style="padding:14px 16px; text-align:left; color:#667eea;
                                   font-size:12px; font-weight:600; letter-spacing:1px; text-transform:uppercase;">
                         Posted
+                      </th>
+                      <th style="padding:14px 16px; text-align:left; color:#667eea;
+                                  font-size:12px; font-weight:600; letter-spacing:1px; text-transform:uppercase;">
+                        Source
                       </th>
                       <th style="padding:14px 16px; text-align:center; color:#667eea;
                                   font-size:12px; font-weight:600; letter-spacing:1px; text-transform:uppercase;">
@@ -713,16 +763,33 @@ def main() -> None:
     for idx, company in enumerate(COMPANIES, start=1):
         logger.info("[%d/%d] Checking: %s", idx, len(COMPANIES), company)
         try:
-            jobs = get_linkedin_jobs(company)
+            jobs_by_source: list[dict] = []
+            source_collectors = [
+                ("LinkedIn", get_linkedin_jobs),
+                ("Careers", get_company_careers_jobs),
+                ("Greenhouse", get_greenhouse_jobs),
+                ("Lever", get_lever_jobs),
+                ("Ashby", get_ashby_jobs),
+                ("Wellfound", get_wellfound_jobs),
+                ("Google", get_google_jobs),
+            ]
 
-            # Fallback to Google if LinkedIn returned nothing
-            if not jobs:
-                logger.info("  → LinkedIn empty, trying Google fallback...")
-                jobs = get_google_jobs(company)
+            for source_name, collector in source_collectors:
+                try:
+                    collected_jobs = collector(company)
+                    if collected_jobs:
+                        logger.info("%s: %d job(s)", source_name, len(collected_jobs))
+                    else:
+                        logger.info("%s: 0 job(s)", source_name)
+                    jobs_by_source.extend(collected_jobs)
+                except Exception as exc:
+                    logger.warning("%s failed for %s: %s", source_name, company, exc)
 
-            # Filter to only truly new jobs that match the candidate profile
-            for job in jobs:
-                key = job["job_id"]
+            deduped_jobs = deduplicate_jobs(jobs_by_source)
+            logger.info("Unique jobs after deduplication: %d", len(deduped_jobs))
+
+            for job in deduped_jobs:
+                key = job.get("job_id") or job.get("job_url") or ""
                 title = job.get("title", "")
                 company_name = job.get("company", "")
                 normalized_company = normalize_company_name(company_name)
@@ -740,10 +807,11 @@ def main() -> None:
                     logger.info("  ⏭ SKIP: %s @ %s (not a strong match)", title, company_name)
                     continue
 
-                if key and key not in seen_jobs:
+                dedup_key = _make_job_key(job)
+                if dedup_key and dedup_key not in seen_jobs:
                     all_new_jobs.append(job)
-                    seen_jobs.add(key)
-                    logger.info("  ✦ NEW: %s @ %s (%s)", title, company_name, key)
+                    seen_jobs.add(dedup_key)
+                    logger.info("  ✦ NEW: %s @ %s (%s)", title, company_name, job.get("source", "Unknown"))
 
         except Exception as exc:
             errors += 1
