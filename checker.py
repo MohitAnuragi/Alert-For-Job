@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # ─── Constants ───────────────────────────────────────────────────────────────
 
 SEEN_JOBS_FILE = "seen_jobs.json"
-WHITELIST_CSV_FILE = "final_master_startup_sheet_150.csv"
+WHITELIST_CSV_FILE = "final_updated_companies_list.csv"
 RECIPIENT_EMAIL = "crazymohit468@gmail.com"
 MAX_RETRIES = 3
 BASE_BACKOFF = 2  # seconds
@@ -194,6 +194,8 @@ def load_company_whitelist(csv_path: str = WHITELIST_CSV_FILE) -> set[str]:
         sys.exit(1)
 
     logger.info("Loaded company whitelist.")
+    logger.info("Source:")
+    logger.info("%s", csv_path)
     logger.info("Approved companies: %d", len(companies))
     return companies
 
