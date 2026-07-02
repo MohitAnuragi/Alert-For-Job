@@ -40,6 +40,9 @@ class RelevanceFilterTests(unittest.TestCase):
         finally:
             os.remove(temp_path)
 
+    def test_uses_updated_company_list_by_default(self):
+        self.assertEqual(load_company_whitelist.__defaults__[0], "final_updated_companies_list.csv")
+
 
 if __name__ == "__main__":
     unittest.main()
