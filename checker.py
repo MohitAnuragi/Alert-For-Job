@@ -1,6 +1,6 @@
 """
 Job Alert System — checker.py
-Monitors 142 startup companies for new SDE/Android internship job postings on LinkedIn.
+Monitors startup companies for new SDE/Android internship job postings across multiple sources.
 Sends HTML email alerts via Gmail SMTP when new openings are detected.
 State is persisted in seen_jobs.json committed back to GitHub.
 """
@@ -17,7 +17,9 @@ import sys
 import time
 import urllib.parse
 from datetime import date
+from functools import lru_cache
 from typing import Optional
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -45,33 +47,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
-]
-
-COMPANIES = [
-    "Appsmith", "ToolJet", "Hoppscotch", "SigNoz", "Hasura", "Supabase",
-    "Postman", "Razorpay", "Juspay", "Zeta", "Meesho", "Swiggy", "Zepto",
-    "CRED", "ShareChat", "Koo", "Pocket FM", "Stage", "Rooter", "Chingari",
-    "Krutrim", "Sarvam AI", "Mad Street Den", "SigTuple", "Uniphore",
-    "Yellow.ai", "Rephrase.ai", "Ganit", "Fi Money", "Jar", "Slice", "Navi",
-    "Uni Cards", "Open Financial Technologies", "Rupeek", "Perfios",
-    "Banyan Cloud", "Airlearn", "Nbyula", "DrinkPrime", "SkilloVilla",
-    "Turbostart", "2070 Health", "Outplay", "Ati Motors", "Peppermint Robotics",
-    "Masai School", "Newton School", "Scaler", "FunctionUp", "ClearFeed",
-    "Infilect", "100ms", "ARTPARK", "CloudSEK", "Openhouse", "Eloelo",
-    "Vymo", "Zycus", "Leap Finance", "Instawork", "EarnIn", "SWARA",
-    "demtech.ai", "Gamtus", "Senzcraft", "Zaimler", "Playo", "Triplespeed",
-    "Bibha AI Labs", "Groww", "Upstox", "CoinDCX", "BrowserStack",
-    "Freshworks", "Chargebee", "Zoho", "Whatfix", "Capillary", "Darwinbox",
-    "Unacademy", "Vedantu", "Byjus", "PhysicsWallah", "Testbook", "Toppr",
-    "Coding Ninjas", "Scaler Academy", "InterviewBit", "GeekyAnts",
-    "Livspace", "Urban Company", "NoBroker", "Housing", "MagicBricks",
-    "Ola Electric", "Bounce", "Ather Energy", "Yulu", "Rapido", "Delhivery",
-    "Shadowfax", "BlackBuck", "Rivigo", "Porter", "Locus", "Shipsy",
-    "Pickrr", "ElasticRun", "OfBusiness", "Dunzo", "Pocketly", "Credgenics",
-    "Fampay", "Simpl", "OkCredit", "Khatabook", "Udaan", "Infra.Market",
-    "Bizongo", "DealShare", "CityMall", "Trella", "Loadshare", "FarEye",
-    "Ninjacart", "Frnd", "Turnip", "Loco", "Bolo Live", "Kubeapps",
-    "M365Consult", "Ekagga Technology", "NewSpace Research",
 ]
 
 APPROVED_ROLE_PHRASES = (
@@ -145,13 +120,24 @@ REJECTED_TITLE_TERMS = (
 
 SOURCE_PRIORITY = {
     "Careers": 0,
-    "Greenhouse": 1,
-    "Lever": 2,
-    "Ashby": 3,
-    "Wellfound": 4,
-    "LinkedIn": 5,
-    "Google": 6,
+    "Wellfound": 1,
+    "LinkedIn": 2,
+    "Google": 3,
 }
+
+HTTP_SESSION = requests.Session()
+COMPANY_CATALOG_CACHE: Optional[list[dict]] = None
+CAREER_PATH_CANDIDATES = [
+    "/careers",
+    "/jobs",
+    "/careers/jobs",
+    "/careers/openings",
+    "/work-with-us",
+    "/join-us",
+    "/careers/open-roles",
+    "/open-positions",
+    "/jobs/all",
+]
 
 
 def _normalize_text(text: str) -> str:
@@ -180,8 +166,12 @@ def normalize_company_name(company_name: str) -> str:
     return normalized
 
 
-def load_company_whitelist(csv_path: str = WHITELIST_CSV_FILE) -> set[str]:
-    """Load approved companies from the CSV once and return them as a set."""
+def load_company_catalog(csv_path: str = WHITELIST_CSV_FILE) -> list[dict]:
+    """Load the CSV once into an in-memory catalog of display and normalized names."""
+    global COMPANY_CATALOG_CACHE
+    if COMPANY_CATALOG_CACHE is not None and csv_path == WHITELIST_CSV_FILE:
+        return COMPANY_CATALOG_CACHE
+
     if not os.path.exists(csv_path):
         logger.error("ERROR\nUnable to load company whitelist.\nFile:\n%s\nExecution stopped.", csv_path)
         sys.exit(1)
@@ -189,26 +179,57 @@ def load_company_whitelist(csv_path: str = WHITELIST_CSV_FILE) -> set[str]:
     try:
         with open(csv_path, "r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
-            companies = set()
+            catalog: list[dict] = []
             for row in reader:
-                company_name = row.get("Company") or row.get("Name") or ""
-                normalized_company = normalize_company_name(company_name)
-                if normalized_company:
-                    companies.add(normalized_company)
+                display_name = ""
+                for key in ("Company", "Name", "company", "name"):
+                    if row.get(key):
+                        display_name = row.get(key, "")
+                        break
+                normalized_name = normalize_company_name(display_name)
+                if not display_name or not normalized_name:
+                    continue
+                catalog.append(
+                    {
+                        "display_name": display_name.strip(),
+                        "normalized_name": normalized_name,
+                        "career_page_url": (row.get("Career Page URL") or row.get("Career Page") or row.get("Career URL") or "").strip(),
+                    }
+                )
     except Exception as exc:
         logger.error("ERROR\nUnable to load company whitelist.\nFile:\n%s\nExecution stopped.", csv_path)
         logger.error("CSV parse error: %s", exc)
         sys.exit(1)
 
+    if not catalog:
+        logger.error("ERROR\nUnable to load company whitelist.\nFile:\n%s\nExecution stopped.", csv_path)
+        sys.exit(1)
+
+    logger.info("Loaded company catalog.")
+    logger.info("Source:")
+    logger.info("%s", csv_path)
+    logger.info("Loaded companies: %d", len(catalog))
+    COMPANY_CATALOG_CACHE = catalog
+    return catalog
+
+
+def load_company_whitelist(csv_path: str = WHITELIST_CSV_FILE) -> set[str]:
+    """Load approved companies from the CSV once and return them as a set."""
+    catalog = load_company_catalog(csv_path)
+    companies = {entry["normalized_name"] for entry in catalog if entry.get("normalized_name")}
     if not companies:
         logger.error("ERROR\nUnable to load company whitelist.\nFile:\n%s\nExecution stopped.", csv_path)
         sys.exit(1)
 
-    logger.info("Loaded company whitelist.")
-    logger.info("Source:")
-    logger.info("%s", csv_path)
+    logger.info("Loaded whitelist.")
     logger.info("Approved companies: %d", len(companies))
     return companies
+
+
+def load_companies_from_csv(csv_path: str = WHITELIST_CSV_FILE) -> list[str]:
+    """Load the display company names from the CSV in their original order."""
+    catalog = load_company_catalog(csv_path)
+    return [entry["display_name"] for entry in catalog]
 
 
 def _job_source_rank(source_name: str) -> int:
@@ -283,13 +304,10 @@ def _get_random_headers() -> dict:
 
 
 def _fetch_with_retry(url: str, timeout: int = 15) -> Optional[requests.Response]:
-    """
-    Fetch a URL with up to MAX_RETRIES attempts and exponential backoff.
-    Returns the Response on success, or None on all failures.
-    """
+    """Fetch a URL with up to MAX_RETRIES attempts and exponential backoff."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = requests.get(
+            response = HTTP_SESSION.get(
                 url,
                 headers=_get_random_headers(),
                 timeout=timeout,
@@ -431,29 +449,20 @@ def get_linkedin_jobs(company_name: str) -> list[dict]:
 # ─── Scraper: Google Fallback ─────────────────────────────────────────────────
 
 def get_google_jobs(company_name: str) -> list[dict]:
-    """
-    Fallback: Google-search for the company's internship postings on LinkedIn.
-    Extracts /jobs/view/ URLs from search results.
-
-    Args:
-        company_name: The company name to search for.
-
-    Returns:
-        List of job dicts. Returns empty list on any failure.
-    """
+    """Fallback: search Google for LinkedIn job view links for the company."""
     try:
-        query = urllib.parse.quote_plus(
-            f"{company_name} intern site:linkedin.com/jobs/view"
-        )
+        query = urllib.parse.quote_plus(f"{company_name} intern site:linkedin.com/jobs/view")
         url = f"https://www.google.com/search?q={query}&num=20"
         response = _fetch_with_retry(url)
         if response is None:
             return []
 
         soup = BeautifulSoup(response.text, "html.parser")
+        jobs: list[dict] = []
+        seen_ids: set[str] = set()
+
         for tag in soup.find_all("a", href=True):
-            href = tag["href"]
-            # Google wraps links in /url?q=...
+            href = tag.get("href", "")
             if "/url?q=" in href:
                 href = urllib.parse.unquote(href.split("/url?q=")[1].split("&")[0])
 
@@ -465,8 +474,6 @@ def get_google_jobs(company_name: str) -> list[dict]:
                 seen_ids.add(job_id)
 
                 job_url = f"https://www.linkedin.com/jobs/view/{job_id}/"
-
-                # Try to pull title from the surrounding anchor text
                 title = tag.get_text(strip=True) or "Internship Opening"
                 if not title or len(title) < 3:
                     title = "Internship Opening"
@@ -483,11 +490,116 @@ def get_google_jobs(company_name: str) -> list[dict]:
                     }
                 )
 
-        logger.info("Google fallback → %s: found %d job(s)", company_name, len(jobs))
+        logger.info("Google → %s: found %d job(s)", company_name, len(jobs))
         return jobs
 
     except Exception as exc:
         logger.warning("get_google_jobs failed for %s: %s", company_name, exc)
+        return []
+
+
+def _is_job_candidate_url(href: str) -> bool:
+    lowered = href.lower()
+    return any(token in lowered for token in ["/careers", "/jobs", "/job", "/opening", "/role", "/position", "/apply"])
+
+
+def get_company_careers_jobs(company_name: str) -> list[dict]:
+    """Search the company's official website for careers or jobs pages and extract links."""
+    try:
+        company_entry = next(
+            (entry for entry in load_company_catalog() if entry.get("display_name") == company_name),
+            None,
+        )
+        career_page_url = (company_entry or {}).get("career_page_url", "")
+        if not career_page_url.startswith("http"):
+            logger.info("Career Site → %s: no official careers URL available", company_name)
+            return []
+
+        base_url = career_page_url.rstrip("/")
+        candidates = [base_url]
+        parsed = urlparse(base_url)
+        base_path = parsed.path.rstrip("/") or ""
+        if not any(base_path.endswith(path) for path in CAREER_PATH_CANDIDATES):
+            for path in CAREER_PATH_CANDIDATES:
+                candidates.append(f"{base_url}{path}")
+
+        jobs: list[dict] = []
+        seen_urls: set[str] = set()
+        for candidate in candidates:
+            response = _fetch_with_retry(candidate)
+            if response is None:
+                continue
+            soup = BeautifulSoup(response.text, "html.parser")
+            for tag in soup.find_all("a", href=True):
+                href = tag.get("href", "")
+                if not href:
+                    continue
+                resolved_href = urljoin(candidate, href)
+                if resolved_href in seen_urls:
+                    continue
+                seen_urls.add(resolved_href)
+                if not _is_job_candidate_url(resolved_href):
+                    continue
+                parsed_href = urlparse(resolved_href)
+                if parsed_href.netloc and parsed_href.netloc != parsed.netloc:
+                    continue
+                title = tag.get_text(" ", strip=True) or "Internship Opening"
+                jobs.append(
+                    {
+                        "job_id": resolved_href,
+                        "title": title,
+                        "company": company_name,
+                        "location": "India",
+                        "posted_time": "",
+                        "job_url": resolved_href,
+                        "source": "Careers",
+                    }
+                )
+            if jobs:
+                break
+
+        logger.info("Career Site → %s: found %d job(s)", company_name, len(jobs))
+        return jobs
+    except Exception as exc:
+        logger.warning("get_company_careers_jobs failed for %s: %s", company_name, exc)
+        return []
+
+
+def get_wellfound_jobs(company_name: str) -> list[dict]:
+    """Search Wellfound for the company and extract job links."""
+    try:
+        query = urllib.parse.quote_plus(f'{company_name} site:wellfound.com internship')
+        response = _fetch_with_retry(f"https://www.google.com/search?q={query}&num=10")
+        if response is None:
+            return []
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        jobs: list[dict] = []
+        seen_urls: set[str] = set()
+        for tag in soup.find_all("a", href=True):
+            href = tag.get("href", "")
+            if "/url?q=" in href:
+                href = urllib.parse.unquote(href.split("/url?q=")[1].split("&")[0])
+            if not href.startswith("http") or href in seen_urls:
+                continue
+            seen_urls.add(href)
+            if "wellfound.com" in href.lower() and any(token in href.lower() for token in ["job", "jobs", "career"]):
+                title = tag.get_text(" ", strip=True) or "Internship Opening"
+                jobs.append(
+                    {
+                        "job_id": href,
+                        "title": title,
+                        "company": company_name,
+                        "location": "India",
+                        "posted_time": "",
+                        "job_url": href,
+                        "source": "Wellfound",
+                    }
+                )
+        logger.info("Wellfound → %s: found %d job(s)", company_name, len(jobs))
+        return jobs
+    except Exception as exc:
+        logger.warning("get_wellfound_jobs failed for %s: %s", company_name, exc)
         return []
 
 
@@ -532,7 +644,7 @@ def save_seen_jobs(seen: set[str]) -> None:
 
 # ─── Email ────────────────────────────────────────────────────────────────────
 
-def _build_html_email(new_jobs: list[dict]) -> str:
+def _build_html_email(new_jobs: list[dict], company_count: int) -> str:
     """Build a rich HTML email body for the given list of new jobs."""
     today = date.today().strftime("%B %d, %Y")
     rows_html = ""
@@ -599,7 +711,7 @@ def _build_html_email(new_jobs: list[dict]) -> str:
             <td style="padding:32px 40px;">
               <p style="margin:0 0 24px; color:#a0aec0; font-size:15px; line-height:1.6;">
                 The job monitor found <strong style="color:#667eea;">{len(new_jobs)} new opening(s)</strong>
-                across the 142 tracked startup companies. Click <strong>Apply →</strong> to view the full
+                across the {company_count} tracked startup companies. Click <strong>Apply →</strong> to view the full
                 job listing on LinkedIn.
               </p>
 
@@ -649,7 +761,7 @@ def _build_html_email(new_jobs: list[dict]) -> str:
               <p style="margin:0; color:#4a5568; font-size:12px; line-height:1.7;">
                 This alert was generated automatically by the
                 <strong style="color:#667eea;">Job Alert Monitor</strong> running on GitHub Actions.<br>
-                Checking 142 startup companies every 4 hours · Mon – Sat<br>
+                Checking {company_count} startup companies every 4 hours · Mon – Sat<br>
                 <em>You're receiving this because you set up this alert system.</em>
               </p>
             </td>
@@ -675,7 +787,7 @@ def _esc(text: str) -> str:
     )
 
 
-def send_email(new_jobs: list[dict]) -> None:
+def send_email(new_jobs: list[dict], company_count: int) -> None:
     """
     Send an HTML email alert listing all new internship openings via Gmail SMTP.
 
@@ -697,7 +809,7 @@ def send_email(new_jobs: list[dict]) -> None:
 
     today_str = date.today().strftime("%B %d, %Y")
     subject = f"🚨 {len(new_jobs)} New Internship Opening(s) Found! — {today_str}"
-    html_body = _build_html_email(new_jobs)
+    html_body = _build_html_email(new_jobs, company_count)
 
     # Build MIME message manually (no external deps)
     boundary = "===============job_alert_boundary=="
@@ -751,85 +863,106 @@ def main() -> None:
     4. If new jobs found: send email alert, save updated seen_jobs.json.
     5. Print a summary log line.
     """
+    started_at = time.perf_counter()
+    companies = load_companies_from_csv()
     logger.info("═" * 60)
-    logger.info("Job Alert Monitor starting — checking %d companies.", len(COMPANIES))
+    logger.info("Job Alert Monitor starting — checking %d companies.", len(companies))
+    logger.info("Loaded companies: %d", len(companies))
     logger.info("═" * 60)
 
     approved_companies = load_company_whitelist()
     seen_jobs: set[str] = load_seen_jobs()
     all_new_jobs: list[dict] = []
     errors: int = 0
+    total_jobs_discovered = 0
+    matching_jobs_count = 0
 
-    for idx, company in enumerate(COMPANIES, start=1):
-        logger.info("[%d/%d] Checking: %s", idx, len(COMPANIES), company)
+    for idx, company in enumerate(companies, start=1):
+        logger.info("[%d/%d] Searching: %s", idx, len(companies), company)
         try:
             jobs_by_source: list[dict] = []
             source_collectors = [
                 ("LinkedIn", get_linkedin_jobs),
-                ("Careers", get_company_careers_jobs),
-                ("Greenhouse", get_greenhouse_jobs),
-                ("Lever", get_lever_jobs),
-                ("Ashby", get_ashby_jobs),
+                ("Career Site", get_company_careers_jobs),
                 ("Wellfound", get_wellfound_jobs),
-                ("Google", get_google_jobs),
             ]
+            found_any_source_jobs = False
 
             for source_name, collector in source_collectors:
                 try:
+                    logger.info("  → %s", source_name)
                     collected_jobs = collector(company)
                     if collected_jobs:
-                        logger.info("%s: %d job(s)", source_name, len(collected_jobs))
+                        found_any_source_jobs = True
+                        logger.info("    %s: %d job(s)", source_name, len(collected_jobs))
                     else:
-                        logger.info("%s: 0 job(s)", source_name)
+                        logger.info("    %s: 0 job(s)", source_name)
                     jobs_by_source.extend(collected_jobs)
                 except Exception as exc:
                     logger.warning("%s failed for %s: %s", source_name, company, exc)
 
-            deduped_jobs = deduplicate_jobs(jobs_by_source)
-            logger.info("Unique jobs after deduplication: %d", len(deduped_jobs))
+            if not found_any_source_jobs:
+                try:
+                    logger.info("  → Google")
+                    google_jobs = get_google_jobs(company)
+                    if google_jobs:
+                        logger.info("    Google: %d job(s)", len(google_jobs))
+                    else:
+                        logger.info("    Google: 0 job(s)")
+                    jobs_by_source.extend(google_jobs)
+                except Exception as exc:
+                    logger.warning("Google failed for %s: %s", company, exc)
 
+            deduped_jobs = deduplicate_jobs(jobs_by_source)
+            total_jobs_discovered += len(deduped_jobs)
+            logger.info("Unique jobs: %d", len(deduped_jobs))
+
+            matching_roles = 0
             for job in deduped_jobs:
-                key = job.get("job_id") or job.get("job_url") or ""
                 title = job.get("title", "")
                 company_name = job.get("company", "")
                 normalized_company = normalize_company_name(company_name)
 
-                logger.info("Company: %s", company_name)
-                logger.info("Normalized: %s", normalized_company)
+                logger.info("  Company: %s", company_name)
+                logger.info("  Normalized: %s", normalized_company)
                 if normalized_company not in approved_companies:
-                    logger.info("Whitelist: NO")
-                    logger.info("Skipping job.")
+                    logger.info("  Whitelist: NO")
+                    logger.info("  Skipping job.")
                     continue
 
-                logger.info("Whitelist: YES")
+                logger.info("  Whitelist: YES")
 
                 if not is_relevant_job(title):
-                    logger.info("  ⏭ SKIP: %s @ %s (not a strong match)", title, company_name)
+                    logger.info("    ⏭ SKIP: %s @ %s (not a strong match)", title, company_name)
                     continue
 
+                matching_roles += 1
                 dedup_key = _make_job_key(job)
                 if dedup_key and dedup_key not in seen_jobs:
                     all_new_jobs.append(job)
                     seen_jobs.add(dedup_key)
-                    logger.info("  ✦ NEW: %s @ %s (%s)", title, company_name, job.get("source", "Unknown"))
+                    logger.info("    ✦ NEW: %s @ %s (%s)", title, company_name, job.get("source", "Unknown"))
+
+            matching_jobs_count += matching_roles
+            logger.info("Matching roles: %d", matching_roles)
+            logger.info("New notifications: %d", matching_roles)
 
         except Exception as exc:
             errors += 1
             logger.warning("Unexpected error for %s: %s", company, exc)
 
-        # Polite delay between companies to avoid bot detection
-        sleep_secs = random.uniform(3, 6)
+        sleep_secs = random.uniform(2, 4)
         time.sleep(sleep_secs)
 
-    # ─── Results ──────────────────────────────────────────────────────────────
+    elapsed = time.perf_counter() - started_at
     logger.info("═" * 60)
     logger.info(
-        "Checked %d companies. Found %d new job(s). Errors: %d.",
-        len(COMPANIES), len(all_new_jobs), errors,
+        "Summary: companies checked=%d, total jobs discovered=%d, matching jobs=%d, new notifications=%d, elapsed=%.2fs, errors=%d.",
+        len(companies), total_jobs_discovered, matching_jobs_count, len(all_new_jobs), elapsed, errors,
     )
 
     if all_new_jobs:
-        send_email(all_new_jobs)
+        send_email(all_new_jobs, len(companies))
         save_seen_jobs(seen_jobs)
         logger.info("State saved. All done. ✅")
     else:

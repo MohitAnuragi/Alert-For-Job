@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 
-from checker import deduplicate_jobs, is_relevant_job, load_company_whitelist, normalize_company_name
+from checker import deduplicate_jobs, is_relevant_job, load_companies_from_csv, load_company_whitelist, normalize_company_name
 
 
 class RelevanceFilterTests(unittest.TestCase):
@@ -51,6 +51,17 @@ class RelevanceFilterTests(unittest.TestCase):
         try:
             approved = load_company_whitelist(temp_path)
             self.assertEqual(approved, {"razorpay", "browserstack", "sprinto"})
+        finally:
+            os.remove(temp_path)
+
+    def test_loads_original_company_display_names_from_csv(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".csv", encoding="utf-8") as handle:
+            handle.write("Company\nRazorpay Pvt Ltd\nOpen Financial Technologies\n")
+            temp_path = handle.name
+
+        try:
+            companies = load_companies_from_csv(temp_path)
+            self.assertEqual(companies, ["Razorpay Pvt Ltd", "Open Financial Technologies"])
         finally:
             os.remove(temp_path)
 
